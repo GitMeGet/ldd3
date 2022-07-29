@@ -14,10 +14,10 @@
 
 #include <linux/uaccess.h>	/* copy_*_user */
 
-#define SCULL_MAJOR 0
-#define SCULL_NR_DEVS 4
-#define SCULL_QUANTUM 4000
-#define SCULL_QSET 1000
+#include "scull.h"
+
+MODULE_AUTHOR("Tan Yu Peng");
+MODULE_LICENSE("GPL");
 
 int scull_major =   SCULL_MAJOR;
 int scull_minor =   0;
@@ -31,25 +31,9 @@ module_param(scull_nr_devs, int, S_IRUGO);
 module_param(scull_quantum, int, S_IRUGO);
 module_param(scull_qset, int, S_IRUGO);
 
-MODULE_AUTHOR("Tan Yu Peng");
-MODULE_LICENSE("GPL");
-
 struct scull_dev *scull_devices;	/* allocated in scull_init_module */
 
-struct scull_qset {
-    void **data;
-    struct scull_qset *next;
-};
-
-struct scull_dev {
-    struct scull_qset *data;    /* Pointer to first quantum set */
-    int quantum;                /* the current quantum size */
-    int qset;                   /* the current array size */
-    unsigned long size;         /* amount of data stored here */
-    unsigned int access_key;    /* used by sculluid and scullpriv */
-    struct semaphore sem;       /* mutual exclusion semaphore */
-    struct cdev cdev;           /* Char device structure */
-};
+/* ---------------------- helper functions ---------------------- */
 
 int scull_trim(struct scull_dev *dev)
 {
@@ -71,11 +55,6 @@ int scull_trim(struct scull_dev *dev)
     dev->qset = SCULL_QSET;
     dev->data = NULL;
 
-    return 0;
-}
-
-int scull_release(struct inode *inode, struct file *filp)
-{
     return 0;
 }
 
@@ -108,6 +87,8 @@ struct scull_qset *scull_follow(struct scull_dev *dev, int n)
     return qs;
 }
 
+/* ---------------------- file operations ---------------------- */
+
 int scull_open(struct inode *inode, struct file *filp)
 {
     struct scull_dev *dev;    /* device information */
@@ -127,38 +108,37 @@ ssize_t scull_read(struct file *filp, char __user *buf, size_t count, loff_t *f_
     struct scull_dev *dev = filp->private_data;
     struct scull_qset *dptr;
     int quantum = dev->quantum, qset = dev->qset;
-    int itemsize = quantum * qset;                            /* how many bytes in a quantum set (linked-list node) */
+    int itemsize = quantum * qset;     /* bytes in a quantum set (linked-list node) */
     int item, s_pos, q_pos, rest;
     ssize_t retval = 0;
 
-    if (down_interruptible(&dev->sem))                        /* try to acquire semaphore */
+    if (down_interruptible(&dev->sem)) /* try to acquire semaphore */
         return -ERESTARTSYS;
 
-    if (*f_pos >= dev->size)                                  /* current read position > device size */
+    if (*f_pos >= dev->size)           /* current read position > device size */
         goto out;
 
-    if (*f_pos + count > dev->size)                           /* only read till device size */
+    if (*f_pos + count > dev->size)    /* only read till device size */
         count = dev->size - *f_pos;
 
-    item = (long)*f_pos / itemsize;                           /* which node in linked-list? */
-    rest = (long)*f_pos % itemsize;                           /* which data in this node has been read? */
-    s_pos = rest / quantum;                                   /* index of quantum (array element) in quantum set (array) */
-    q_pos = rest % quantum;                                   /* offset into quantum (chunk of data) */
+    item = (long)*f_pos / itemsize;    /* which node in linked-list? */
+    rest = (long)*f_pos % itemsize;    /* which data in this node has been read? */
+    s_pos = rest / quantum;            /* index of quantum (array element) in quantum set (array) */
+    q_pos = rest % quantum;            /* offset into quantum (chunk of data) */
 
-    dptr = scull_follow(dev, item);                           /* get linked-list node (defined elsewhere) */
+    dptr = scull_follow(dev, item);    /* get linked-list node (defined elsewhere) */
 
-    if (dptr == NULL || !dptr->data || !dptr->data[s_pos])    /* don't account for holes, return if data is invalid */
+    /* don't account for holes, return if data is invalid */
+    if (dptr == NULL || !dptr->data || !dptr->data[s_pos])
         goto out;
 
-    if (count > quantum - q_pos)                              /* read only to the end of this quantum */
+    if (count > quantum - q_pos)       /* read only to the end of this quantum */
         count = quantum - q_pos;
 
     if (copy_to_user(buf, dptr->data[s_pos] + q_pos, count)) {
         retval = -EFAULT;
         goto out;
     }
-
-    printk("%s\n", (char*) dptr->data[s_pos]+q_pos);
 
     *f_pos += count;
     retval = count;
@@ -175,7 +155,7 @@ ssize_t scull_write(struct file *filp, const char __user *buf, size_t count, lof
     int quantum = dev->quantum, qset = dev->qset;
     int itemsize = quantum *qset;
     int item, s_pos, q_pos, rest;
-    ssize_t retval = -ENOMEM;                                 /* value used in "goto out" statements */
+    ssize_t retval = -ENOMEM;          /* value used in "goto out" statements */
 
     if (down_interruptible(&dev->sem)) return -ERESTARTSYS;
 
@@ -185,29 +165,28 @@ ssize_t scull_write(struct file *filp, const char __user *buf, size_t count, lof
     s_pos = rest / quantum;
     q_pos = rest % quantum;
 
-    dptr = scull_follow(dev, item);                           /* follow the list up to the right position */
+    dptr = scull_follow(dev, item);    /* follow the list up to the right position */
 
-    if (dptr == NULL) goto out;                               /* end of linked-list */
+    if (dptr == NULL) goto out;        /* end of linked-list */
 
-    if (!dptr->data) {                                        /* allocate array of pointers */
+    if (!dptr->data) {                 /* allocate array of pointers */
         dptr->data = kmalloc(qset * sizeof(char *), GFP_KERNEL);
         if (!dptr->data) goto out;
         memset(dptr->data, 0, qset * sizeof(char *));
     }
 
-    if (!dptr->data[s_pos]) {                                 /* allocate pointer data (quantum) */
+    if (!dptr->data[s_pos]) {          /* allocate pointer data (quantum) */
         dptr->data[s_pos] = kmalloc(quantum, GFP_KERNEL);
         if (!dptr->data[s_pos]) goto out;
     }
 
-    if (count > quantum - q_pos) count = quantum - q_pos;     /* write only up to the end of this quantum */
+    /* write only up to the end of this quantum */
+    if (count > quantum - q_pos) count = quantum - q_pos;
 
     if (copy_from_user(dptr->data[s_pos]+q_pos, buf, count)) {
         retval = -EFAULT;
         goto out;
     }
-
-    printk("%s\n", (char*) dptr->data[s_pos]+q_pos);
 
     *f_pos += count;
     retval = count;
@@ -222,17 +201,20 @@ out:
 
 }
 
+int scull_release(struct inode *inode, struct file *filp)
+{
+    return 0;
+}
+
+/* ---------------------- module stuff ---------------------- */
+
 struct file_operations scull_fops = {
     .owner = THIS_MODULE,
+    .open = scull_open,
     .read = scull_read,
     .write = scull_write,
-    .open = scull_open,
     .release = scull_release,
 };
-
-/*
- * Finally, the module stuff
- */
 
 /*
  * The cleanup function is used to handle initialization failures as well.
@@ -241,12 +223,11 @@ struct file_operations scull_fops = {
  */
 void scull_cleanup_module(void)
 {
-    int i;
     dev_t devno = MKDEV(scull_major, scull_minor);
 
     /* Get rid of our char dev entries */
     if (scull_devices) {
-        for (i = 0; i < scull_nr_devs; i++) {
+        for (int i = 0; i < scull_nr_devs; i++) {
             scull_trim(scull_devices + i);
             cdev_del(&scull_devices[i].cdev);
         }
@@ -259,8 +240,6 @@ void scull_cleanup_module(void)
 
     /* cleanup_module is never called if registering failed */
     unregister_chrdev_region(devno, scull_nr_devs);
-
-    /* TODO: call the cleanup functions for friend devices */
 }
 
 /*
@@ -281,7 +260,7 @@ static void scull_setup_cdev(struct scull_dev *dev, int index)
 
 int scull_init_module(void)
 {
-    int result, i;
+    int result;
     dev_t dev = 0;
 
     /*
@@ -313,7 +292,7 @@ int scull_init_module(void)
     memset(scull_devices, 0, scull_nr_devs * sizeof(struct scull_dev));
 
     /* Initialize each device. */
-    for (i = 0; i < scull_nr_devs; i++) {
+    for (int i = 0; i < scull_nr_devs; i++) {
         scull_devices[i].quantum = scull_quantum;
         scull_devices[i].qset = scull_qset;
         sema_init(&scull_devices[i].sem, 1);
